@@ -31,3 +31,38 @@ let image2 = vae.decode(latents)
 
 Depends only on [mlx-swift](https://github.com/ml-explore/mlx-swift) — no engine, no tokenizers,
 no model dependency. MIT.
+
+## GPU numerics: the decoder's 3×3 convs (2026-09-24)
+
+mlx's Metal `conv2d` takes a Winograd F(6×6,3×3) path when the conv is 3×3, stride 1, dilation 1,
+groups 1, C % 32 == 0, O % 32 == 0, C + O ≥ 256 and N·H·W ≥ 4096. On M5 that path loses precision:
+about 6.4e-3 relL2 per conv in fp32, because its inner GEMM runs TF32 (`MLX_ENABLE_TF32` defaults
+on), and about 5.8e-2 in bf16.
+
+This decoder has 32 such convs at 1024²: conv_in 32→512, the 512-, 256- and 128-channel resnets,
+and the upsamplers. The consumers' own VAE gates (for example Lens P3) pin the CPU device, so the
+GPU decode had never been gated. Every stride-1 3×3 conv is now a `WinogradFreeConv2d`, which routes
+only the in-window shapes through `conv3d` with kT = 1.
+
+Measurements, on the M5 Max with mlx-swift 0.31.6:
+
+| Decode, compared against | Raw conv2d (Winograd) | conv3d route |
+|---|---|---|
+| Lens 512² golden (real T2I latent, PyTorch fp32 CPU), GPU fp32 | 1.9e-3 · 65.3 dB · max 3.4e-2 | 4.0e-4 · 78.8 dB · max 3.4e-3 |
+| Same golden, GPU **bf16** (ERNIE's production decode) | 1.26e-2 · **48.7 dB** · max 0.17 | 4.7e-3 · 57.3 dB · max 0.036 |
+| 1024² decode time, fp32 / bf16 (isolated, median of 3 rounds) | 583 ms / 431 ms | **+750 ms / +707 ms** |
+
+- The CPU lane reproduces the golden to 3.5e-6.
+- The ~4e-4 that remains with the route is TF32 in the mid-block attention (fp32 `Linear` and SDPA).
+  With `MLX_ENABLE_TF32=0` the route is 3.4e-6 from the CPU lane, and raw Winograd is 3.6e-6.
+- The fp32 loss (Klein, Lens) is below 8-bit visibility: at most 4 levels on [0, 255].
+- The bf16 loss (ERNIE) sits under the 8-bit floor of about 59 dB. The route recovers about 8.6 dB,
+  but more than doubles decode time. Whether consumers adopt it is a per-product decision.
+- Set `vae.winogradFreeConvs = false` or `FLUX2VAE_WINOGRAD=1` to restore raw conv2d.
+
+Tests:
+
+- `swift test --filter WinogradProbeTests` is weight-free. It is the removal signal: when raw conv2d
+  reports exact on a new pin, remove the route.
+- `FLUX2VAE_PARITY=1 swift test -c release -Xswiftc -enable-testing --filter VAEGPULaneTests` needs
+  the golden, a lossless safetensors conversion of `lens-mlx/goldens/lens_goldens.npz`.

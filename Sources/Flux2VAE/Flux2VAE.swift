@@ -37,12 +37,12 @@ public final class Flux2ResnetBlock2D: Module {
     public init(inChannels: Int, outChannels: Int, eps: Float = 1e-6, groups: Int = 32) {
         self._norm1.wrappedValue = GroupNorm(
             groupCount: groups, dimensions: inChannels, eps: eps, pytorchCompatible: true)
-        self._conv1.wrappedValue = Conv2d(
+        self._conv1.wrappedValue = WinogradFreeConv2d(
             inputChannels: inChannels, outputChannels: outChannels,
             kernelSize: 3, stride: 1, padding: 1)
         self._norm2.wrappedValue = GroupNorm(
             groupCount: groups, dimensions: outChannels, eps: eps, pytorchCompatible: true)
-        self._conv2.wrappedValue = Conv2d(
+        self._conv2.wrappedValue = WinogradFreeConv2d(
             inputChannels: outChannels, outputChannels: outChannels,
             kernelSize: 3, stride: 1, padding: 1)
         self._convShortcut.wrappedValue = inChannels != outChannels
@@ -111,7 +111,7 @@ public final class Flux2Upsample2D: Module {
     @ModuleInfo(key: "conv") var conv: Conv2d
 
     public init(channels: Int, outChannels: Int? = nil) {
-        self._conv.wrappedValue = Conv2d(
+        self._conv.wrappedValue = WinogradFreeConv2d(
             inputChannels: channels, outputChannels: outChannels ?? channels,
             kernelSize: 3, stride: 1, padding: 1)
         super.init()
@@ -191,7 +191,7 @@ public final class Flux2Decoder: Module {
         blockOutChannels: [Int] = [128, 256, 512, 512],
         layersPerBlock: Int = 2, normNumGroups: Int = 32, eps: Float = 1e-6
     ) {
-        self._convIn.wrappedValue = Conv2d(
+        self._convIn.wrappedValue = WinogradFreeConv2d(
             inputChannels: inChannels, outputChannels: blockOutChannels.last!,
             kernelSize: 3, stride: 1, padding: 1)
         self._midBlock.wrappedValue = Flux2UNetMidBlock2D(
@@ -209,7 +209,7 @@ public final class Flux2Decoder: Module {
         self._convNormOut.wrappedValue = GroupNorm(
             groupCount: normNumGroups, dimensions: blockOutChannels[0],
             eps: eps, pytorchCompatible: true)
-        self._convOut.wrappedValue = Conv2d(
+        self._convOut.wrappedValue = WinogradFreeConv2d(
             inputChannels: blockOutChannels[0], outputChannels: outChannels,
             kernelSize: 3, stride: 1, padding: 1)
         super.init()
@@ -256,6 +256,15 @@ public final class Flux2VAE: Module {
         self._decoder.wrappedValue = Flux2Decoder()
         self._bn.wrappedValue = Flux2BatchNormStats(numFeatures: 4 * Self.latentChannels)
         super.init()
+    }
+
+    /// Whether in-window 3×3 convs take the exact conv3d route (default) instead of mlx's lossy
+    /// Winograd conv2d. `false` is for A/B validation only (WinogradFreeConv2d.swift).
+    public var winogradFreeConvs: Bool {
+        get { modules().allSatisfy { ($0 as? WinogradFreeConv2d)?.enabled ?? true } }
+        set {
+            for case let conv as WinogradFreeConv2d in modules() { conv.enabled = newValue }
+        }
     }
 
     public func decode(_ latents: MLXArray) -> MLXArray {

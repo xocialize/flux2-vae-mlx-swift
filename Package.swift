@@ -28,5 +28,15 @@ let package = Package(
             ],
             path: "Sources/Flux2VAE"
         ),
+        .testTarget(
+            name: "Flux2VAETests",
+            dependencies: [
+                "Flux2VAE",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "Tests/Flux2VAETests"
+        ),
     ]
 )
