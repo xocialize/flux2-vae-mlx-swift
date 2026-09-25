@@ -256,15 +256,15 @@ public final class Flux2VAE: Module {
         self._decoder.wrappedValue = Flux2Decoder()
         self._bn.wrappedValue = Flux2BatchNormStats(numFeatures: 4 * Self.latentChannels)
         super.init()
+        convRoute = Flux2VAEConvRoute.environmentOverride ?? .winograd
     }
 
-    /// Whether in-window 3×3 convs take the exact conv3d route (default) instead of mlx's lossy
-    /// Winograd conv2d. `false` is for A/B validation only (WinogradFreeConv2d.swift).
-    public var winogradFreeConvs: Bool {
-        get { modules().allSatisfy { ($0 as? WinogradFreeConv2d)?.enabled ?? true } }
-        set {
-            for case let conv as WinogradFreeConv2d in modules() { conv.enabled = newValue }
-        }
+    /// Route for the decoder's in-window 3×3 convs (WinogradFreeConv2d.swift). Default
+    /// `.winograd` (mlx's fast path; its fp32 loss is below 8-bit visibility). `.conv3d` is exact
+    /// (+750 ms per 1024² decode — parity lanes); `.fp32Winograd` is the bf16 middle ground.
+    public var convRoute: Flux2VAEConvRoute {
+        get { modules().lazy.compactMap { ($0 as? WinogradFreeConv2d)?.route }.first ?? .winograd }
+        set { for case let conv as WinogradFreeConv2d in modules() { conv.route = newValue } }
     }
 
     public func decode(_ latents: MLXArray) -> MLXArray {

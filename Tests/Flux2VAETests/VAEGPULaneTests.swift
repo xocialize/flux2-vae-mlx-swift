@@ -56,12 +56,13 @@ final class VAEGPULaneTests: XCTestCase {
         }
     }
 
-    /// GPU decode with the route on/off; warm-up run, then the mean of `reps` timed runs.
-    static func gpuDecode(_ vae: Flux2VAE, _ packed: MLXArray, route: Bool, reps: Int = 3)
-        -> (MLXArray, Double)
-    {
-        vae.winogradFreeConvs = route
-        defer { vae.winogradFreeConvs = true }
+    /// GPU decode on a conv route; warm-up run, then the mean of `reps` timed runs.
+    static func gpuDecode(
+        _ vae: Flux2VAE, _ packed: MLXArray, route: Flux2VAEConvRoute, reps: Int = 3
+    ) -> (MLXArray, Double) {
+        let saved = vae.convRoute
+        vae.convRoute = route
+        defer { vae.convRoute = saved }
         var out = vae.decodePackedLatents(packed)
         eval(out)
         let t0 = Date()
@@ -91,16 +92,18 @@ final class VAEGPULaneTests: XCTestCase {
         let vae16 = try Flux2VAEWeights.loadVAE(directory: Self.vaeDir, dtype: .bfloat16)
 
         let cpu = Self.onCPU { vae32.decodePackedLatents(packed) }
-        let (r32, _) = Self.gpuDecode(vae32, packed, route: true)
-        let (w32, _) = Self.gpuDecode(vae32, packed, route: false)
-        let (r16, _) = Self.gpuDecode(vae16, packed.asType(.bfloat16), route: true)
-        let (w16, _) = Self.gpuDecode(vae16, packed.asType(.bfloat16), route: false)
+        let (r32, _) = Self.gpuDecode(vae32, packed, route: .conv3d)
+        let (w32, _) = Self.gpuDecode(vae32, packed, route: .winograd)
+        let (r16, _) = Self.gpuDecode(vae16, packed.asType(.bfloat16), route: .conv3d)
+        let (u16, _) = Self.gpuDecode(vae16, packed.asType(.bfloat16), route: .fp32Winograd)
+        let (w16, _) = Self.gpuDecode(vae16, packed.asType(.bfloat16), route: .winograd)
         print("[golden 512² vs PyTorch fp32 CPU]")
-        print("  CPU lane fp32         \(Self.stats(cpu, ref))")
-        print("  GPU fp32, route       \(Self.stats(r32, ref))")
-        print("  GPU fp32, raw conv2d  \(Self.stats(w32, ref))")
-        print("  GPU bf16, route       \(Self.stats(r16, ref))")
-        print("  GPU bf16, raw conv2d  \(Self.stats(w16, ref))")
+        print("  CPU lane fp32            \(Self.stats(cpu, ref))")
+        print("  GPU fp32, conv3d route   \(Self.stats(r32, ref))")
+        print("  GPU fp32, raw Winograd   \(Self.stats(w32, ref))")
+        print("  GPU bf16, conv3d route   \(Self.stats(r16, ref))")
+        print("  GPU bf16, fp32 Winograd  \(Self.stats(u16, ref))")
+        print("  GPU bf16, raw Winograd   \(Self.stats(w16, ref))")
         print("  GPU fp32 route vs CPU lane  \(Self.stats(r32, cpu))")
         print("  GPU fp32 raw   vs CPU lane  \(Self.stats(w32, cpu))")
         XCTAssertLessThan(Self.stats(r32, cpu).relL2, 1e-3, "GPU route vs CPU lane")
@@ -113,10 +116,11 @@ final class VAEGPULaneTests: XCTestCase {
                      Date().timeIntervalSince(t0)))
         Memory.clearCache()  // the CPU lane leaves tens of GB pooled; don't time against that
         let rows = [
-            ("GPU fp32, route      ", Self.gpuDecode(vae32, big, route: true)),
-            ("GPU fp32, raw conv2d ", Self.gpuDecode(vae32, big, route: false)),
-            ("GPU bf16, route      ", Self.gpuDecode(vae16, big.asType(.bfloat16), route: true)),
-            ("GPU bf16, raw conv2d ", Self.gpuDecode(vae16, big.asType(.bfloat16), route: false)),
+            ("GPU fp32, conv3d route  ", Self.gpuDecode(vae32, big, route: .conv3d)),
+            ("GPU fp32, raw Winograd  ", Self.gpuDecode(vae32, big, route: .winograd)),
+            ("GPU bf16, conv3d route  ", Self.gpuDecode(vae16, big.asType(.bfloat16), route: .conv3d)),
+            ("GPU bf16, fp32 Winograd ", Self.gpuDecode(vae16, big.asType(.bfloat16), route: .fp32Winograd)),
+            ("GPU bf16, raw Winograd  ", Self.gpuDecode(vae16, big.asType(.bfloat16), route: .winograd)),
         ]
         for (label, (img, ms)) in rows {
             print(String(format: "  %@ %@  %7.1f ms", label, Self.stats(img, cpuBig).description, ms))
@@ -134,14 +138,15 @@ final class VAEGPULaneTests: XCTestCase {
         for dtype in [DType.float32, .bfloat16] {
             let vae = try Flux2VAEWeights.loadVAE(directory: Self.vaeDir, dtype: dtype)
             let z = big.asType(dtype)
-            var route = [Double](), raw = [Double]()
+            var t: [Flux2VAEConvRoute: [Double]] = [:]
+            let routes: [Flux2VAEConvRoute] = dtype == .float32 ? [.conv3d, .winograd] : [.conv3d, .fp32Winograd, .winograd]
             for _ in 0..<3 {
-                route.append(Self.gpuDecode(vae, z, route: true).1)
-                raw.append(Self.gpuDecode(vae, z, route: false).1)
+                for r in routes { t[r, default: []].append(Self.gpuDecode(vae, z, route: r).1) }
             }
-            print(String(format: "[timing 1024² %@] route %@ ms | raw %@ ms | median delta %+.0f ms",
-                         dtype == .float32 ? "fp32" : "bf16", fmt(route), fmt(raw),
-                         median(route) - median(raw)))
+            let line = routes.map { r in
+                String(format: "%@ %@ ms (median %.0f)", r.rawValue, fmt(t[r]!), median(t[r]!))
+            }.joined(separator: " | ")
+            print("[timing 1024² \(dtype == .float32 ? "fp32" : "bf16")] \(line)")
             Memory.clearCache()
         }
     }
