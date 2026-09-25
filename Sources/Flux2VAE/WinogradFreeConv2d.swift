@@ -33,7 +33,7 @@ public enum Flux2VAEConvRoute: String, Sendable {
     case fp32Winograd
 
     /// `FLUX2VAE_CONV_ROUTE` = winograd | conv3d | fp32Winograd, if set.
-    static var environmentOverride: Flux2VAEConvRoute? {
+    public static var environmentOverride: Flux2VAEConvRoute? {
         getenv("FLUX2VAE_CONV_ROUTE").flatMap { Flux2VAEConvRoute(rawValue: String(cString: $0)) }
     }
 }
