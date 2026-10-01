@@ -17,11 +17,13 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
+        .package(url: "https://github.com/xocialize/mlx-exact-conv-swift", from: "0.1.0"),
     ],
     targets: [
         .target(
             name: "Flux2VAE",
             dependencies: [
+                .product(name: "MLXExactConv", package: "mlx-exact-conv-swift"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
