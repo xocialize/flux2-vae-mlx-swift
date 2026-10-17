@@ -249,11 +249,16 @@ public final class Flux2VAE: Module {
     @ModuleInfo(key: "decoder") var decoder: Flux2Decoder
     @ModuleInfo(key: "bn") var bn: Flux2BatchNormStats
 
-    public override init() {
+    /// Decoder widths of the full FLUX.2 decoder. BFL's FLUX.2-small-decoder (Apache-2.0, a distilled
+    /// drop-in, ~28M vs ~50M params) is `smallDecoderBlockOutChannels`.
+    public static let fullDecoderBlockOutChannels = [128, 256, 512, 512]
+    public static let smallDecoderBlockOutChannels = [96, 192, 384, 384]
+
+    public init(decoderBlockOutChannels: [Int] = Flux2VAE.fullDecoderBlockOutChannels) {
         self._postQuantConv.wrappedValue = Conv2d(
             inputChannels: Self.latentChannels, outputChannels: Self.latentChannels,
             kernelSize: 1, padding: 0)
-        self._decoder.wrappedValue = Flux2Decoder()
+        self._decoder.wrappedValue = Flux2Decoder(blockOutChannels: decoderBlockOutChannels)
         self._bn.wrappedValue = Flux2BatchNormStats(numFeatures: 4 * Self.latentChannels)
         super.init()
         convRoute = Flux2VAEConvRoute.environmentOverride ?? .winograd

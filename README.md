@@ -29,6 +29,14 @@ let image = vae.decodePackedLatents(latents)   // (B, 3, H, W)
 let image2 = vae.decode(latents)
 ```
 
+**Small decoder.** `loadVAE` reads the decoder widths from the snapshot's `config.json`
+(`decoder_block_out_channels`, else `block_out_channels`), so BFL's
+[FLUX.2-small-decoder](https://huggingface.co/black-forest-labs/FLUX.2-small-decoder) (Apache-2.0,
+widths [96, 192, 384, 384], ~28M vs ~50M decoder params) loads as-is — as shipped inside the MOSS-Image
+snapshots. `Flux2VAE(decoderBlockOutChannels:)` builds either; the default is the full decoder.
+Gated against diffusers `AutoencoderKLFlux2` fp32 (moss-image oracle): relL2 1.8e-4 on the exact conv
+route, 3.5e-3 on the default route.
+
 Depends only on [mlx-swift](https://github.com/ml-explore/mlx-swift) — no engine, no tokenizers,
 no model dependency. MIT.
 

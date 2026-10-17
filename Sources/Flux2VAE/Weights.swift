@@ -19,9 +19,11 @@ public enum Flux2VAEError: Error, CustomStringConvertible {
 
 public enum Flux2VAEWeights {
 
-    /// Load the FLUX.2 VAE (decoder-only) from a diffusers `vae/` snapshot.
+    /// Load the FLUX.2 VAE (decoder-only) from a diffusers `vae/` snapshot. The decoder widths come
+    /// from `config.json` (`decoder_block_out_channels`, else `block_out_channels`), so the
+    /// FLUX.2-small-decoder snapshots load as-is; without a config the full decoder is assumed.
     public static func loadVAE(directory: URL, dtype: DType = .float32) throws -> Flux2VAE {
-        let vae = Flux2VAE()
+        let vae = Flux2VAE(decoderBlockOutChannels: try decoderBlockOutChannels(directory: directory))
         var state: [String: MLXArray] = [:]
         for (rawKey, rawValue) in try loadAllArrays(directory: directory) {
             if rawKey.hasSuffix("num_batches_tracked") { continue }
@@ -38,6 +40,17 @@ public enum Flux2VAEWeights {
         }
         try verifyAndLoad(model: vae, weights: state, label: "VAE")
         return vae
+    }
+
+    /// Decoder widths declared by a diffusers `vae/config.json`.
+    public static func decoderBlockOutChannels(directory: URL) throws -> [Int] {
+        let url = directory.appendingPathComponent("config.json")
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return Flux2VAE.fullDecoderBlockOutChannels
+        }
+        let config = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any] ?? [:]
+        let widths = (config["decoder_block_out_channels"] ?? config["block_out_channels"]) as? [Int]
+        return widths ?? Flux2VAE.fullDecoderBlockOutChannels
     }
 
     static func loadAllArrays(directory: URL) throws -> [String: MLXArray] {
