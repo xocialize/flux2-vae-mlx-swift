@@ -42,6 +42,22 @@ public enum Flux2VAEWeights {
         return vae
     }
 
+    /// Load the encoder half (`encoder.*`, `quant_conv.*` and the `bn` stats for `encodePacked`) from the same
+    /// diffusers `vae/` snapshot. Attention keys keep `to_out.0.` (the encoder's `to_out` is a one-element list).
+    public static func loadEncoder(directory: URL, dtype: DType = .float32) throws -> Flux2VAEEncoder {
+        let encoder = Flux2VAEEncoder()
+        var state: [String: MLXArray] = [:]
+        for (k, rawValue) in try loadAllArrays(directory: directory) {
+            guard k.hasPrefix("encoder.") || k.hasPrefix("quant_conv.") || k.hasPrefix("bn.") else { continue }
+            if k.hasSuffix("num_batches_tracked") { continue }
+            var v = rawValue
+            if v.ndim == 4 { v = v.transposed(0, 2, 3, 1) }  // PT (O,I,kH,kW) -> MLX (O,kH,kW,I)
+            state[k] = k.hasPrefix("bn.") ? v.asType(.float32) : v.asType(dtype)
+        }
+        try verifyAndLoad(model: encoder, weights: state, label: "VAE encoder")
+        return encoder
+    }
+
     /// Decoder widths declared by a diffusers `vae/config.json`.
     public static func decoderBlockOutChannels(directory: URL) throws -> [Int] {
         let url = directory.appendingPathComponent("config.json")

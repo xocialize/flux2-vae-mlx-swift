@@ -1,6 +1,6 @@
 # flux2-vae-mlx-swift
 
-The **FLUX.2 VAE** (decoder path) as a neutral, standalone Swift/MLX package.
+The **FLUX.2 VAE** (decoder, and since 0.5.0 the encoder) as a neutral, standalone Swift/MLX package.
 
 Extracted from [lens-mlx-swift](https://github.com/xocialize/lens-mlx-swift) so multiple
 text-to-image backers can **share the VAE without depending on each other's model packages**.
@@ -28,6 +28,16 @@ let image = vae.decodePackedLatents(latents)   // (B, 3, H, W)
 // …or a plain decode of standard latents:
 let image2 = vae.decode(latents)
 ```
+
+**Encoder (0.5.0).** `Flux2VAEWeights.loadEncoder(directory:)` loads the encoder tower, `quant_conv` and the `bn`
+stats from the same `vae/` snapshot. It came here from flux2-klein-swift's `KleinVAEEncoder`, so every FLUX.2-VAE
+consumer shares one encoder.
+- `encodeMean(_:)` returns the deterministic latent mean.
+- `encodePacked(_:)` returns the 2×2-patchified, bn-normalised latents the FLUX.2 and FLUX 3 DiTs consume (the
+  inverse of `decodePackedLatents`).
+- The in-window convs run exact by default.
+- Gated against BFL's FLUX 3 klein reference `AutoEncoder.encode` (its VAE is this VAE, identical weights): reference
+  tokens cos 0.999999 (GPU fp32).
 
 **Small decoder.** `loadVAE` reads the decoder widths from the snapshot's `config.json`
 (`decoder_block_out_channels`, else `block_out_channels`), so BFL's
