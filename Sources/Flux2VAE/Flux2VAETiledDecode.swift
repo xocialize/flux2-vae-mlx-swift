@@ -25,7 +25,8 @@ import MLXExactConv
 import MLXFast
 import MLXNN
 
-/// Band size for `Flux2VAE.decode(_:tile:)` / `decodePackedLatents(_:tile:)`.
+/// Band size for `Flux2VAE.decode(_:tile:)` / `decodePackedLatents(_:tile:)` and
+/// `Flux2VAEEncoder.encodeMean(_:tile:)` / `encodePacked(_:tile:)`.
 public struct Flux2VAETile: Sendable, Equatable {
     /// Bytes of one row band of a stage's widest tensor, in fp32: about the size of each temporary a band
     /// allocates (a GroupNorm'd band is ~5 of them). Also caps one query chunk's attention scores.
@@ -117,7 +118,7 @@ final class RowBands {
 }
 
 /// GroupNorm on a band with whole-tensor stats; fp32 out, like `GroupNorm` on an fp32 input.
-private func groupNormed(_ x: MLXArray, _ norm: GroupNorm, _ stats: (mean: MLXArray, invStd: MLXArray)) -> MLXArray {
+func groupNormed(_ x: MLXArray, _ norm: GroupNorm, _ stats: (mean: MLXArray, invStd: MLXArray)) -> MLXArray {
     let (b, h, w, c) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3))
     var y = x.asType(.float32).reshaped(b, h, w, norm.groupCount, c / norm.groupCount)
     y = ((y - stats.mean) * stats.invStd).reshaped(b, h, w, c)
@@ -127,7 +128,7 @@ private func groupNormed(_ x: MLXArray, _ norm: GroupNorm, _ stats: (mean: MLXAr
 
 /// A stride-1 conv (1×1, or 3×3 with padding 1) over `height` rows, one band at a time. `input(lo, hi)` yields rows
 /// lo..<hi of the conv's input; `epilogue(r0, r1, y)` maps each output band; `done(r1)` runs once rows < r1 are out.
-private func bandedConv(
+func bandedConv(
     _ conv: Conv2d, height: Int, batch: Int, width: Int, inChannels: Int, tile: Flux2VAETile,
     input: (Int, Int) -> MLXArray,
     epilogue: (Int, Int, MLXArray) -> MLXArray = { _, _, y in y },

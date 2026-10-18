@@ -29,6 +29,10 @@ let image = vae.decodePackedLatents(latents)   // (B, 3, H, W)
 let image2 = vae.decode(latents)
 // Memory-bounded, same image (0.6.0, opt-in): 1024² fp32 peak 10.7 → 2.4 GB, 2048² 42 → 6.9 GB.
 let image3 = vae.decodePackedLatents(latents, tile: .standard)
+
+// Encoder (0.5.0), and its memory-bounded form (0.7.0, opt-in): 2048² fp32 peak 22.7 → 4.6 GB.
+let encoder = try Flux2VAEWeights.loadEncoder(directory: vaeDir, dtype: .float32)
+let packed = encoder.encodePacked(pixels, tile: .standard)   // pixels: (B, 3, H, W) in [-1, 1]
 ```
 
 **Encoder (0.5.0).** `Flux2VAEWeights.loadEncoder(directory:)` loads the encoder tower, `quant_conv` and the `bn`
@@ -109,6 +113,57 @@ every 64 at 2048²) the worst row is below the worst row elsewhere, on every rou
 `swift test --filter TiledDecodeTests` is weight-free. It decodes a random narrow decoder untiled and in bands down to
 one row, on the CPU and the GPU. It sits at 3–5e-6 on the CPU, and a broken halo reads ~1.1.
 `Flux2VAEBench` (`decode` / `compare` / `golden`) reproduces the tables.
+
+## Memory-bounded encode (0.7.0)
+
+`encodePacked(_:tile:)` and `encodeMean(_:tile:)` on `Flux2VAEEncoder` are the same row-band recipe applied to the
+encoder, with the same `Flux2VAETile`. They return the same latents as the untiled encode. Nothing changes for callers
+that don't pass `tile:`.
+
+```swift
+let packed = encoder.encodePacked(pixels, tile: .standard)   // 64 MB bands
+```
+
+**Where the untiled peak comes from.** The mid-block attention runs at H/8 with 512 channels. At 2048² that is 65 536
+tokens, and the reference's explicit softmax(QKᵀ)V materialises a 17 GB score matrix. The full-resolution stage comes
+next: 128 channels, 2 GB per tensor at 2048², plus its GroupNorm temporaries.
+
+**What is new over the decode.** The encoder adds the stride-2 downsample: it pads the bottom and right by one row and
+column, then runs a valid 3×3 stride-2 conv. Output row i reads input rows 2i, 2i+1 and 2i+2. So:
+- an output band o0..<o1 reads input rows 2·o0..<2·o1+1;
+- the zero pad row appears only when 2·o1 reaches the bottom edge;
+- input rows below 2·o1 are released once that band is out.
+
+Everything else is the decode's recipe: whole-tensor GroupNorm stats, a one-row halo per stride-1 3×3 conv, and
+query-chunked attention against whole-image K/V. The attention keeps the reference's explicit softmax. Softmax is per
+query row, so chunking the queries changes nothing. The floor is one full-resolution resnet's input plus its middle
+tensor, about 4 GB fp32 at 2048².
+
+**Measured** on the M5 Max with mlx-swift 0.32.2:
+- Setup: a Wikimedia Commons photo, centre-cropped and Lanczos-resized to each size. Encoder alone, fp32, on the
+  encoder's default `.conv3d` (exact) route. One cold run per process, behind the GPU contention gate.
+- `Memory.peakMemory` is read with `Memory.cacheLimit` = 2 GB (AB-L-0192). 0.13–0.18 GB of it is resident weights
+  and the input.
+- Bands are 64 MB.
+
+| Encode, fp32 `.conv3d` | untiled | tiled | time, untiled → tiled |
+|---|---|---|---|
+| 512² | 2.21 GB | **0.83 GB** | 162 → 238 ms |
+| 1024² | 5.78 GB | **1.59 GB** | 620 → 805 ms |
+| 2048² | 22.72 GB | **4.63 GB** | 3.21 → 3.50 s |
+
+**Parity**, tiled vs untiled packed latents (relL2 · max · PSNR over [−1, 1]):
+- 512²: 1.4e-5 · 4.0e-4 · 103.7 dB.
+- 1024²: 1.1e-5 · 1.6e-4 · 106.1 dB.
+- 2048²: 9.4e-6 · 1.4e-4 · 107.1 dB.
+- The ~1e-5 is TF32 on differently shaped GEMMs, not tiling. With `MLX_ENABLE_TF32=0`, 1024² tiled vs untiled is
+  2.3e-6 · 119.4 dB. TF32 alone moves the untiled encode by 2.2e-3, about 200× more.
+
+**No seams.** The worst latent row is at most 1.6× the median row, and the worst column is at most 1.4× the median.
+
+`swift test --filter TiledEncodeTests` is weight-free. It encodes with a random narrow encoder, untiled and in bands
+down to one row, on the CPU and the GPU. Its 100-row case gives the last downsample an odd-height input.
+`Flux2VAEBench encode` + `compare` reproduces the table.
 
 ## GPU numerics: the decoder's 3×3 convs (2026-09-24)
 

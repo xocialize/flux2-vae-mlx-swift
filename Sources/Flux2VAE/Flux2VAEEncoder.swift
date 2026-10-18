@@ -8,12 +8,12 @@ import Foundation
 import MLX
 import MLXNN
 
-private func encSilu(_ x: MLXArray) -> MLXArray { x * sigmoid(x) }
+func encSilu(_ x: MLXArray) -> MLXArray { x * sigmoid(x) }
 private func encGroupNorm(_ groups: Int, _ channels: Int, _ eps: Float) -> GroupNorm {
     GroupNorm(groupCount: groups, dimensions: channels, eps: eps, pytorchCompatible: true)
 }
 
-private final class EncResnetBlock2D: Module {
+final class EncResnetBlock2D: Module {
     @ModuleInfo var norm1: GroupNorm
     @ModuleInfo var conv1: Conv2d
     @ModuleInfo var norm2: GroupNorm
@@ -39,7 +39,7 @@ private final class EncResnetBlock2D: Module {
     }
 }
 
-private final class EncDownsample2D: Module {
+final class EncDownsample2D: Module {
     @ModuleInfo var conv: Conv2d
     init(_ channels: Int) {
         self._conv.wrappedValue = Conv2d(inputChannels: channels, outputChannels: channels, kernelSize: 3, stride: 2, padding: 0)
@@ -51,7 +51,7 @@ private final class EncDownsample2D: Module {
     }
 }
 
-private final class EncVAEAttention: Module {
+final class EncVAEAttention: Module {
     @ModuleInfo(key: "group_norm") var groupNorm_: GroupNorm
     @ModuleInfo(key: "to_q") var toQ: Linear
     @ModuleInfo(key: "to_k") var toK: Linear
@@ -78,7 +78,7 @@ private final class EncVAEAttention: Module {
     }
 }
 
-private final class EncMidBlock2D: Module {
+final class EncMidBlock2D: Module {
     @ModuleInfo var resnets: [EncResnetBlock2D]
     @ModuleInfo var attentions: [EncVAEAttention]
     init(_ channels: Int, groups: Int = 32, eps: Float = 1e-6) {
@@ -90,7 +90,7 @@ private final class EncMidBlock2D: Module {
     func callAsFunction(_ x: MLXArray) -> MLXArray { resnets[1](attentions[0](resnets[0](x))) }
 }
 
-private final class EncDownBlock2D: Module {
+final class EncDownBlock2D: Module {
     @ModuleInfo var resnets: [EncResnetBlock2D]
     @ModuleInfo var downsamplers: [EncDownsample2D]?
     init(_ inC: Int, _ outC: Int, numLayers: Int, addDownsample: Bool, groups: Int = 32, eps: Float = 1e-6) {
@@ -106,7 +106,7 @@ private final class EncDownBlock2D: Module {
     }
 }
 
-private final class Flux2EncoderTower: Module {
+final class Flux2EncoderTower: Module {
     @ModuleInfo(key: "conv_in") var convIn: Conv2d
     @ModuleInfo(key: "down_blocks") var downBlocks: [EncDownBlock2D]
     @ModuleInfo(key: "mid_block") var midBlock: EncMidBlock2D
@@ -140,7 +140,7 @@ private final class Flux2EncoderTower: Module {
 /// (`KleinVAEEncoder`) so every FLUX.2-VAE consumer shares one encoder. Loads from the same `vae/` snapshot as the
 /// decoder (`Flux2VAEWeights.loadEncoder`).
 public final class Flux2VAEEncoder: Module {
-    @ModuleInfo fileprivate var encoder: Flux2EncoderTower
+    @ModuleInfo var encoder: Flux2EncoderTower
     @ModuleInfo(key: "quant_conv") var quantConv: Conv2d
     @ModuleInfo(key: "bn") var bn: Flux2BatchNormStats
     public let latentChannels: Int
@@ -178,7 +178,10 @@ public final class Flux2VAEEncoder: Module {
     /// inverse of `Flux2VAE.unpatchifyLatents`) and normalised by the `bn` stats, (x − mean) / sqrt(var + eps).
     /// This is BFL's `AutoEncoder.encode` before its token flatten. H and W must be multiples of 16.
     public func encodePacked(_ imageNCHW: MLXArray) -> MLXArray {
-        let mean = encodeMean(imageNCHW)
+        packed(mean: encodeMean(imageNCHW))
+    }
+
+    func packed(mean: MLXArray) -> MLXArray {
         let (b, c, h, w) = (mean.dim(0), mean.dim(1), mean.dim(2), mean.dim(3))
         let packed = mean.reshaped(b, c, h / 2, 2, w / 2, 2).transposed(0, 1, 3, 5, 2, 4)
             .reshaped(b, 4 * c, h / 2, w / 2)

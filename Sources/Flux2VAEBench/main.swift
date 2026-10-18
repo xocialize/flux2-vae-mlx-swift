@@ -7,6 +7,9 @@
 //     relL2 / maxAbs / PSNR over [-1, 1], plus the per-row and per-column error profile (the seam check).
 //   Flux2VAEBench golden <vaeDir> <latents.safetensors> <route>
 //     512² untiled and tiled (bands as small as 1 MB) against the reference `decoded`.
+//   Flux2VAEBench encode <vaeDir> <image.safetensors> <untiled|tiled> <route> [--bf16] [--band MB] [--save out.safetensors]
+//     Encodes `image` [1, 3, H, W] in [-1, 1] to packed latents and prints the MLX peak under the same 2 GB pool cap;
+//     --save writes them as `image` so `compare` reads them.
 
 import Flux2VAE
 import Foundation
@@ -58,7 +61,7 @@ func route(_ s: String) -> Flux2VAEConvRoute {
     return r
 }
 
-guard let mode = args.first else { fail("usage: decode | compare | golden (see the header)") }
+guard let mode = args.first else { fail("usage: decode | compare | golden | encode (see the header)") }
 args.removeFirst()
 
 switch mode {
@@ -117,6 +120,35 @@ case "compare":
         }
         print(line)
     }
+
+case "encode":
+    let bf16 = has("--bf16")
+    let bandMB = flag("--band").flatMap(Int.init)
+    let save = flag("--save")
+    guard args.count == 4 else { fail("encode <vaeDir> <image.safetensors> <untiled|tiled> <route>") }
+    Memory.cacheLimit = 2 << 30  // MLXServeCore .automatic
+    let dtype: DType = bf16 ? .bfloat16 : .float32
+    let encoder = try Flux2VAEWeights.loadEncoder(directory: URL(fileURLWithPath: args[0]), dtype: dtype)
+    encoder.convRoute = route(args[3])
+    guard let image = try MLX.loadArrays(url: URL(fileURLWithPath: args[1]))["image"]?.asType(dtype) else {
+        fail("no `image` in \(args[1])")
+    }
+    eval(image)
+    let tile = args[2] == "tiled" ? Flux2VAETile(bandBytes: (bandMB ?? 64) << 20) : nil
+    Memory.clearCache()
+    let resident = Memory.activeMemory
+    Memory.peakMemory = 0
+    let t0 = Date()
+    let packed = tile.map { encoder.encodePacked(image, tile: $0) } ?? encoder.encodePacked(image)
+    eval(packed)
+    let ms = Date().timeIntervalSince(t0) * 1000
+    let peak = Memory.peakMemory
+    print(String(
+        format: "[encode] %d×%d %@ %@ %@%@: peak %.2f GB (resident %.2f GB, peak over resident %.2f GB), %.0f ms",
+        image.dim(2), image.dim(3), bf16 ? "bf16" : "fp32", args[3], args[2],
+        tile.map { " band \($0.bandBytes >> 20) MB" } ?? "",
+        Double(peak) / gb, Double(resident) / gb, Double(peak - resident) / gb, ms))
+    if let save { try MLX.save(arrays: ["image": packed.asType(.float32)], url: URL(fileURLWithPath: save)) }
 
 case "golden":
     guard args.count == 3 else { fail("golden <vaeDir> <run_512.safetensors> <route>") }
