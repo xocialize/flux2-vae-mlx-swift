@@ -283,12 +283,15 @@ public final class Flux2VAE: Module {
 
     /// T1: bn de-norm in patchified space (x*std + mean), unpatchify, decode.
     public func decodePackedLatents(_ packedLatents: MLXArray) -> MLXArray {
+        decode(denormalizedUnpatchified(packedLatents))
+    }
+
+    func denormalizedUnpatchified(_ packedLatents: MLXArray) -> MLXArray {
         let bnMean = bn.runningMean.reshaped(1, -1, 1, 1)
         let bnStd = sqrt(bn.runningVar.reshaped(1, -1, 1, 1) + bn.eps)
-        var latents = packedLatents * bnStd.asType(packedLatents.dtype)
+        let latents = packedLatents * bnStd.asType(packedLatents.dtype)
             + bnMean.asType(packedLatents.dtype)
-        latents = Self.unpatchifyLatents(latents)
-        return decode(latents)
+        return Self.unpatchifyLatents(latents)
     }
 
     /// (T4) [B, C, H, W] with C = 4*c -> [B, c, 2H, 2W], diffusers patch order.

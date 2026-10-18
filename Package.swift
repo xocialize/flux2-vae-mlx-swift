@@ -14,6 +14,7 @@ let package = Package(
     ],
     products: [
         .library(name: "Flux2VAE", targets: ["Flux2VAE"]),
+        .executable(name: "Flux2VAEBench", targets: ["Flux2VAEBench"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
@@ -29,6 +30,11 @@ let package = Package(
                 .product(name: "MLXFast", package: "mlx-swift"),
             ],
             path: "Sources/Flux2VAE"
+        ),
+        .executableTarget(
+            name: "Flux2VAEBench",
+            dependencies: ["Flux2VAE", .product(name: "MLX", package: "mlx-swift")],
+            path: "Sources/Flux2VAEBench"
         ),
         .testTarget(
             name: "Flux2VAETests",

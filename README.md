@@ -27,6 +27,8 @@ let vae = try Flux2VAEWeights.loadVAE(directory: vaeDir, dtype: .bfloat16)
 let image = vae.decodePackedLatents(latents)   // (B, 3, H, W)
 // …or a plain decode of standard latents:
 let image2 = vae.decode(latents)
+// Memory-bounded, same image (0.6.0, opt-in): 1024² fp32 peak 10.7 → 2.4 GB, 2048² 42 → 6.9 GB.
+let image3 = vae.decodePackedLatents(latents, tile: .standard)
 ```
 
 **Encoder (0.5.0).** `Flux2VAEWeights.loadEncoder(directory:)` loads the encoder tower, `quant_conv` and the `bn`
@@ -49,6 +51,64 @@ route, 3.5e-3 on the default route.
 
 Depends only on [mlx-swift](https://github.com/ml-explore/mlx-swift) — no engine, no tokenizers,
 no model dependency. MIT.
+
+## Memory-bounded decode (0.6.0)
+
+`decodePackedLatents(_:tile:)` and `decode(_:tile:)` are an opt-in decode in row bands that returns the same image
+as the untiled decode. Nothing changes for callers that don't pass `tile:`.
+
+```swift
+let image = vae.decodePackedLatents(latents, tile: .standard)   // 64 MB bands
+let small = vae.decodePackedLatents(latents, tile: Flux2VAETile(bandBytes: 16 << 20))
+```
+
+**Where the untiled peak comes from.** It is temporaries, not activations. At 1024² the widest tensor is 1 GB (256
+channels at full resolution, fp32). Around it:
+- Each GroupNorm materialises about five copies: a transpose, the layerNorm, the transpose back and the affine.
+- The exact conv route copies its input with an extra channel.
+- The mid-block attention misses MLX's fused SDPA (head dim 512), so the N×N score matrix is materialised: 1 GB at
+  1024², 17 GB at 2048².
+
+**How it works.**
+- Every activation lives as NHWC row bands, never as one tensor plus its temporaries.
+- GroupNorm stats come from all bands (a pairwise mean/M2 combine), then each band is normalised.
+- Each 3×3 conv runs per band, with one real neighbour row on each side as its halo. Zero rows appear only at the
+  image edge, so every band's output is exactly the untiled conv's rows.
+- The attention keeps whole-image K and V, and chunks the queries by rows.
+- An input band is released once no later band needs it.
+
+qwen-image21-swift's recipe (a global prefix, then multi-layer tiles cropped at the receptive field) does not carry
+over. Every resnet here opens with a GroupNorm whose stats span the whole image, so a tile normalised on its own
+stats drifts in colour. The floor is one resnet's full-resolution input plus its middle tensor, 6.7–6.9 GB fp32 at
+2048² measured.
+
+**Measured** on the M5 Max with mlx-swift 0.32.2:
+- Setup: the FLUX 3 klein 512² oracle latent (`latents.15`) tiled up to the size, decoder alone, one cold run per
+  process.
+- `Memory.peakMemory` is read with `Memory.cacheLimit` = 2 GB (the engine's .automatic, AB-L-0192). 0.19 GB of it
+  is resident weights.
+- Bands are 64 MB.
+
+| Decode | 1024² untiled → tiled | 2048² untiled → tiled |
+|---|---|---|
+| fp32, `.winograd` (default route) | 10.68 → **2.37 GB** (940 vs 1349 ms) | 42.10 → **6.89 GB** (4.1 vs 6.4 s) |
+| fp32, `.conv3d` (exact) | 7.83 → 2.27 GB | 30.77 → 6.79 GB |
+| bf16 weights + latents, `.fp32Winograd` | 9.54 → 1.55 GB | 37.85 → 3.82 GB |
+| band size, fp32 `.winograd`: 16 / 64 / 256 MB | 1.87 / 2.37 / 4.35 GB | 6.39 / 6.89 / 8.87 GB |
+
+**Parity**, tiled vs untiled (relL2 · PSNR over [−1, 1]):
+- fp32 `.conv3d`: 4.0e-6 · 118.6 dB at 1024², 4.4e-6 · 117.7 dB at 2048².
+- The 512² oracle decode is 85.9 dB from BFL's reference `decoded` both ways, with bands of 64, 4 and 1 MB.
+- On `.winograd` the tiled and untiled decodes differ by about 1.5–1.9e-3. That gap is Winograd's own noise, not
+  tiling: both sit at 65.08 dB (1024²) and 65.04 dB (2048²) from the exact untiled decode.
+- On bf16 the same holds: both are 56.7–56.8 dB from fp32.
+
+**No seams.** The per-row error profile shows no band edges. At the final stage's edges (every 128 rows at 1024²,
+every 64 at 2048²) the worst row is below the worst row elsewhere, on every route.
+
+`swift test --filter TiledDecodeTests` is weight-free. It decodes a random narrow decoder untiled and in bands down to
+one row, on the CPU and the GPU. It sits at 3–5e-6 on the CPU, and a broken halo reads ~1.1.
+`Flux2VAEBench` (`decode` / `compare` / `golden`) reproduces the tables.
 
 ## GPU numerics: the decoder's 3×3 convs (2026-09-24)
 
