@@ -10,6 +10,15 @@
 //   Flux2VAEBench encode <vaeDir> <image.safetensors> <untiled|tiled> <route> [--bf16] [--band MB] [--save out.safetensors]
 //     Encodes `image` [1, 3, H, W] in [-1, 1] to packed latents and prints the MLX peak under the same 2 GB pool cap;
 //     --save writes them as `image` so `compare` reads them.
+//   Flux2VAEBench flowup <flow_upscaler.safetensors> <pair.safetensors> [--bf16] [--route r] [--save out.safetensors]
+//     FlowUpscaler parity: `latents` [B,32,h,w] (unpatchified, bn-normalised) and `noise` [B,32,2h,2w] in, the ×2
+//     latents out; against the file's `out` (the PyTorch reference's noise − v) when present: cos, relL2, maxAbs.
+//   Flux2VAEBench flowpipe <flow_upscaler.safetensors> <vaeDir> <packed.safetensors> <passes> [--seed N] [--bf16-up]
+//       [--route r] [--save out.safetensors]
+//   Flux2VAEBench flowimg <vaeDir> <in.safetensors> <key> <out.safetensors>
+//     Decodes `key` (unpatchified [1,32,H,W] or packed [1,128,h,w], bn-normalised) with the row-band decode on the exact
+//     route and saves it as `image`, so `compare` can score two upscaler outputs in pixels.
+//   (flowpipe:) `packed` [1,128,h,w] → `passes` ×2 passes → the row-band decode; times and MLX peaks per stage (2 GB pool cap).
 
 import Flux2VAE
 import Foundation
@@ -164,6 +173,86 @@ case "golden":
         let t = vae.decodePackedLatents(packed, tile: Flux2VAETile(bandBytes: mb << 20))[0]
         eval(t)
         print("  tiled band \(mb) MB vs reference  \(stats(t, ref))   vs untiled  \(stats(t, untiled))")
+    }
+
+case "flowup":
+    let bf16 = has("--bf16")
+    let r = flag("--route").map(route) ?? .conv3d
+    let save = flag("--save")
+    guard args.count == 2 else { fail("flowup <weights> <pair.safetensors>") }
+    let up = try FlowUpscaler.load(url: URL(fileURLWithPath: args[0]), dtype: bf16 ? .bfloat16 : .float32)
+    up.unet.convRoute = r
+    let pair = try MLX.loadArrays(url: URL(fileURLWithPath: args[1]))
+    guard let latents = pair["latents"], let noise = pair["noise"] else { fail("pair needs latents + noise") }
+    var out = up.upscale(latents: latents, noise: noise)
+    eval(out)
+    let t0 = Date()
+    out = up.upscale(latents: latents, noise: noise)
+    eval(out)
+    let ms = Date().timeIntervalSince(t0) * 1000
+    print(String(format: "[flowup %@ %@] %@ → %@, warm %.0f ms", bf16 ? "bf16" : "fp32", r.rawValue,
+                 "\(latents.shape)", "\(out.shape)", ms))
+    if let ref = pair["out"] {
+        let a = out.asType(.float32).flattened(), b = ref.asType(.float32).flattened()
+        let cos = sum(a * b) / (sqrt(sum(a * a)) * sqrt(sum(b * b)))
+        eval(cos)
+        print(String(format: "  vs reference: cos %.8f  ", cos.item(Float.self)) + "\(stats(out, ref))")
+        if let refV = pair["v"] {
+            let v = noise.asType(.float32) - out
+            print("  velocity vs reference v: \(stats(v, refV))")
+        }
+    }
+    if let save { try MLX.save(arrays: ["out": out], url: URL(fileURLWithPath: save)) }
+
+case "flowimg":
+    guard args.count == 4 else { fail("flowimg <vaeDir> <in> <key> <out>") }
+    let vae = try Flux2VAEWeights.loadVAE(directory: URL(fileURLWithPath: args[0]), dtype: .float32)
+    vae.convRoute = .conv3d
+    guard var z = try MLX.loadArrays(url: URL(fileURLWithPath: args[1]))[args[2]]?.asType(.float32) else {
+        fail("no `\(args[2])` in \(args[1])")
+    }
+    if z.dim(1) == FlowUpscalerUNet.sampleChannels { z = FlowUpscaler.patchify(z) }
+    let image = vae.decodePackedLatents(z, tile: .standard)
+    eval(image)
+    try MLX.save(arrays: ["image": image], url: URL(fileURLWithPath: args[3]))
+    print("[flowimg] \(args[2]) → \(image.shape)")
+
+case "flowpipe":
+    let bf16Up = has("--bf16-up")
+    let seed = flag("--seed").flatMap(UInt64.init) ?? 0
+    let r = flag("--route").map(route) ?? .conv3d
+    let save = flag("--save")
+    guard args.count == 4, let passes = Int(args[3]) else { fail("flowpipe <weights> <vaeDir> <packed> <passes>") }
+    Memory.cacheLimit = 2 << 30  // MLXServeCore .automatic
+    let up = try FlowUpscaler.load(url: URL(fileURLWithPath: args[0]), dtype: bf16Up ? .bfloat16 : .float32)
+    up.unet.convRoute = r
+    let vae = try Flux2VAEWeights.loadVAE(directory: URL(fileURLWithPath: args[1]), dtype: .float32)
+    guard var packed = try MLX.loadArrays(url: URL(fileURLWithPath: args[2]))["packed"]?.asType(.float32) else {
+        fail("no `packed` in \(args[2])")
+    }
+    eval(packed)
+    // Warm the kernels on the input size (a real worker has run one before).
+    eval(up.upscalePacked(packed, seed: seed))
+    Memory.clearCache()
+    let resident = Memory.activeMemory
+    for i in 0 ..< passes {
+        Memory.peakMemory = 0
+        let t0 = Date()
+        packed = up.upscalePacked(packed, seed: seed &+ UInt64(i))
+        let ms = Date().timeIntervalSince(t0) * 1000
+        print(String(format: "[pass %d] → %d² latent px (%d² image): %.0f ms, peak over resident %.2f GB", i + 1,
+                     packed.dim(2) * 2, packed.dim(2) * 16, ms, Double(Memory.peakMemory - resident) / gb))
+        Memory.clearCache()
+    }
+    Memory.peakMemory = 0
+    let t0 = Date()
+    let image = vae.decodePackedLatents(packed, tile: .standard)
+    eval(image)
+    let ms = Date().timeIntervalSince(t0) * 1000
+    print(String(format: "[decode] %d×%d row-band fp32: %.0f ms, peak over resident %.2f GB", image.dim(3), image.dim(2),
+                 ms, Double(Memory.peakMemory - resident) / gb))
+    if let save {
+        try MLX.save(arrays: ["image": image.asType(.float32), "packed": packed], url: URL(fileURLWithPath: save))
     }
 
 default:

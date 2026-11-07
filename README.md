@@ -53,8 +53,9 @@ snapshots. `Flux2VAE(decoderBlockOutChannels:)` builds either; the default is th
 Gated against diffusers `AutoencoderKLFlux2` fp32 (moss-image oracle): relL2 1.8e-4 on the exact conv
 route, 3.5e-3 on the default route.
 
-Depends only on [mlx-swift](https://github.com/ml-explore/mlx-swift) — no engine, no tokenizers,
-no model dependency. MIT.
+Depends only on [mlx-swift](https://github.com/ml-explore/mlx-swift) and mlx-exact-conv-swift — no engine, no
+tokenizers, no model dependency. MIT. The FlowUpscaler port is derived from public-domain (Unlicense) code and ships
+under this package's MIT licence; its weights stay public domain.
 
 ## Memory-bounded decode (0.6.0)
 
@@ -164,6 +165,58 @@ tensor, about 4 GB fp32 at 2048².
 `swift test --filter TiledEncodeTests` is weight-free. It encodes with a random narrow encoder, untiled and in bands
 down to one row, on the CPU and the GPU. Its 100-row case gives the last downsample an odd-height input.
 `Flux2VAEBench encode` + `compare` reproduces the table.
+
+## FlowUpscaler: ×2 in latent space (0.8.0)
+
+`FlowUpscaler` doubles FLUX.2 latents in one rectified-flow step, before the decode. It is a Swift/MLX port of
+[TensorForger/FlowUpscaler](https://huggingface.co/TensorForger/FlowUpscaler) (Unlicense): a 59M-parameter
+attention-free U-Net (SDXL-style ResNet blocks, GroupNorm, FiLM from the low-resolution latents), distilled from
+FLUX.2 klein-4B generations at 512 → 1024. It serves FLUX.2 klein and FLUX 3 klein alike, whose VAEs are this one
+(AB-A-0257).
+
+```swift
+let up = try FlowUpscaler.load(url: dir.appendingPathComponent("flow_upscaler.safetensors"))  // fp32 compute
+let packed2x = up.upscalePacked(packed, seed: 7)             // [B,128,h,w] → [B,128,2h,2w]
+let packed4x = up.upscalePacked(packed, passes: 2, seed: 7)  // pass i draws its noise from seed + i
+let image = vae.decodePackedLatents(packed4x, tile: .standard)
+```
+
+- **In and out:** packed, bn-normalised latents, the form the DiTs produce and `decodePackedLatents` takes. Inside:
+  unpatchify, `x = noise − v(noise, t = 1000, latents)`, patchify. `upscale(latents:noise:)` takes the unpatchified
+  form and explicit noise (the parity entry).
+- **Weights:** [mlx-community/FlowUpscaler-bf16](https://huggingface.co/mlx-community/FlowUpscaler-bf16) (118.6 MB,
+  Unlicense, PyTorch layouts and key names). `load(url:dtype:)` also reads the original fp32 file.
+- **Convs:** every 3×3 stride-1 conv (384 and 768 channels) sits in mlx's Winograd window (AB-R-0340), so they take
+  the exact route by default (`unet.convRoute`).
+- **Precision:** the default is fp32 compute from the bf16 weights. bf16 compute (`dtype: .bfloat16`) is about 10 %
+  faster and 7 dB further from the reference.
+- **Scale:** it has only seen 512 → 1024. A second pass mostly sharpens. 4096² is the sensible ceiling: the exact
+  decode at 8192² costs about 52 GB even in bf16.
+
+**Parity** against `upscaler_unet.py` (PyTorch CPU fp32; `parity/flowup_pairs.py` makes the pairs from a Klein 4B
+1024² draw; `swift test --filter FlowUpscalerTests`). MLX GPU, M5 Max:
+
+| Case | cos | relL2 | maxAbs |
+|---|---|---|---|
+| 128² → 256² latents, original fp32 weights, fp32 | 1.0000000 | 1.13e-6 | 1.1e-5 |
+| 64×96 → 128×192 | 1.0000001 | 1.14e-6 | 7.9e-6 |
+| 40×56 → 80×112 (odd quarter stage) | 1.0000000 | 1.16e-6 | 8.7e-6 |
+| bf16 weights, fp32 compute, vs the bf16-weight reference | 1.0000001 | 1.13e-6 | 1.1e-5 |
+| bf16 weights, fp32 compute, vs the fp32 reference | 0.9999962 | 2.79e-3 | 2.3e-2 |
+| bf16 weights, bf16 compute (exact route) | 0.9999673 | 8.10e-3 | 9.7e-2 |
+| raw mlx Winograd, fp32 | 0.9999970 | 2.50e-3 | 3.1e-2 |
+| raw mlx Winograd, bf16 | 0.9997123 | 2.40e-2 | 3.1e-1 |
+
+Decoded at 2048² (row-band decode, exact route) against the reference output decoded the same way: the port at fp32
+126.9 dB, bf16 weights in fp32 compute **67.7 dB** (max 3.4 of 255 levels), bf16 compute 60.3 dB.
+
+**Cost** (M5 Max, `Flux2VAEBench flowpipe`, Klein 4B 1024² latents, fp32 compute, MLX pool capped at 2 GB):
+
+| | → 2048² | → 4096² |
+|---|---|---|
+| Upscale pass | 334 ms, peak +2.5 GB | +1.37 s, peak +5.7 GB |
+| Row-band decode (fp32) | 4.3 s, peak +6.7 GB | 21.0 s, peak +24.8 GB |
+| Process phys footprint | 8.9 GB | 28.2 GB |
 
 ## GPU numerics: the decoder's 3×3 convs (2026-09-24)
 
